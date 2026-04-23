@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from typing import Any
+from importlib import import_module
 from functools import lru_cache
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from faster_whisper import WhisperModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("opic-practice-stt")
@@ -76,14 +76,27 @@ async def transcribe_audio(
 
 
 @lru_cache(maxsize=1)
-def get_whisper_model() -> WhisperModel:
+def get_whisper_model() -> Any:
+    try:
+        whisper_module = import_module("faster_whisper")
+        whisper_model_cls = whisper_module.WhisperModel
+    except Exception as exc:
+        logger.exception("Failed to import faster-whisper runtime")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "STT service is unavailable in this environment. "
+                f"faster-whisper runtime could not be loaded: {exc}"
+            ),
+        ) from exc
+
     logger.info(
         "Loading faster-whisper model model_size=%s device=%s compute_type=%s",
         DEFAULT_MODEL_SIZE,
         DEFAULT_DEVICE,
         DEFAULT_COMPUTE_TYPE,
     )
-    return WhisperModel(
+    return whisper_model_cls(
         DEFAULT_MODEL_SIZE,
         device=DEFAULT_DEVICE,
         compute_type=DEFAULT_COMPUTE_TYPE,
