@@ -49,7 +49,7 @@ async def transcribe_audio(
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="audioFile must not be empty.")
 
-    transcript = transcribe_audio_bytes(
+    stt_payload = transcribe_audio_payload(
         audio_bytes=audio_bytes,
         content_type=audioFile.content_type,
         language=language,
@@ -61,17 +61,20 @@ async def transcribe_audio(
         audioFile.filename,
         audioFile.content_type,
         len(audio_bytes),
-        len(transcript),
+        len(str(stt_payload["transcript"])),
     )
 
     return {
-        "transcript": transcript,
+        "transcript": stt_payload["transcript"],
         "language": language,
         "questionId": questionId,
-        "provider": "faster-whisper",
+        "provider": stt_payload["provider"],
         "fileName": audioFile.filename,
         "contentType": audioFile.content_type,
         "fileSize": len(audio_bytes),
+        "confidence": stt_payload.get("confidence"),
+        "languageProbability": stt_payload.get("languageProbability"),
+        "segments": stt_payload.get("segments", []),
     }
 
 
@@ -103,7 +106,7 @@ def get_whisper_model() -> Any:
     )
 
 
-def transcribe_audio_bytes(audio_bytes: bytes, content_type: str | None, language: str) -> str:
+def transcribe_audio_payload(audio_bytes: bytes, content_type: str | None, language: str) -> dict[str, Any]:
     suffix = guess_file_suffix(content_type)
     normalized_language = normalize_language(language)
 
@@ -125,6 +128,18 @@ def transcribe_audio_bytes(audio_bytes: bytes, content_type: str | None, languag
             for segment in segment_list
             if segment.text and segment.text.strip()
         ).strip()
+        segment_payload = [
+            {
+                "start": round(float(getattr(segment, "start", 0.0) or 0.0), 3),
+                "end": round(float(getattr(segment, "end", 0.0) or 0.0), 3),
+                "text": segment.text.strip(),
+                "avgLogProb": _safe_float(getattr(segment, "avg_logprob", None)),
+                "noSpeechProb": _safe_float(getattr(segment, "no_speech_prob", None)),
+            }
+            for segment in segment_list
+            if segment.text and segment.text.strip()
+        ]
+        transcript_confidence = _estimate_transcript_confidence(segment_payload, info)
 
         logger.info(
             "faster-whisper completed language=%s probability=%.4f segments=%s",
@@ -136,7 +151,14 @@ def transcribe_audio_bytes(audio_bytes: bytes, content_type: str | None, languag
         if not transcript:
             raise HTTPException(status_code=422, detail="Speech was detected but no transcript was produced.")
 
-        return transcript
+        return {
+            "transcript": transcript,
+            "language": info.language,
+            "languageProbability": round(float(info.language_probability), 4),
+            "confidence": transcript_confidence,
+            "segments": segment_payload,
+            "provider": "faster-whisper",
+        }
     except HTTPException:
         raise
     except Exception as exc:
@@ -147,6 +169,15 @@ def transcribe_audio_bytes(audio_bytes: bytes, content_type: str | None, languag
             os.remove(temp_audio_path)
         except OSError:
             logger.warning("Failed to remove temporary audio file: %s", temp_audio_path)
+
+
+def transcribe_audio_bytes(audio_bytes: bytes, content_type: str | None, language: str) -> str:
+    payload = transcribe_audio_payload(
+        audio_bytes=audio_bytes,
+        content_type=content_type,
+        language=language,
+    )
+    return str(payload["transcript"])
 
 
 def normalize_language(language: str | None) -> str:
@@ -172,3 +203,27 @@ def guess_file_suffix(content_type: str | None) -> str:
     if "mpeg" in content_type or "mp3" in content_type:
         return ".mp3"
     return ".webm"
+
+
+def _estimate_transcript_confidence(segment_payload: list[dict[str, Any]], info: Any) -> float:
+    confidence_values: list[float] = []
+
+    for segment in segment_payload:
+        if isinstance(segment.get("avgLogProb"), float):
+            confidence_values.append(max(0.0, min(1.0, (segment["avgLogProb"] + 2.0) / 2.0)))
+        elif isinstance(segment.get("noSpeechProb"), float):
+            confidence_values.append(max(0.0, min(1.0, 1.0 - segment["noSpeechProb"])))
+
+    if confidence_values:
+        return round(sum(confidence_values) / len(confidence_values), 4)
+
+    return round(float(getattr(info, "language_probability", 0.0) or 0.0), 4)
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return round(float(value), 4)
+    except (TypeError, ValueError):
+        return None
